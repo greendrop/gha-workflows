@@ -1,0 +1,58 @@
+---
+# betterleaks で PR の差分コミットから秘密情報を検出する（composite action）
+#
+# - betterleaks: https://github.com/betterleaks/betterleaks
+# - pull_request イベントで使う
+# - 呼び出し側で事前に用意するもの:
+#   - actions/checkout（fetch-depth: 0。PR のベースとの merge-base を求めるため）
+#   - betterleaks（mise-action など、リポジトリに合った方法でインストールする）
+#
+# 呼び出し例:
+#   steps:
+#     - uses: actions/checkout@<sha> # vX.Y.Z
+#       with:
+#         persist-credentials: false
+#         fetch-depth: 0
+#     - uses: jdx/mise-action@<sha> # vX.Y.Z
+#       with:
+#         install_args: betterleaks
+#     - uses: greendrop/gha-workflows/actions/secret-scan@<sha> # vX.Y.Z
+name: secret-scan
+description: betterleaks で PR の差分コミットから秘密情報を検出する
+
+runs:
+  using: composite
+  steps:
+    - name: Check prerequisites
+      shell: bash
+      env:
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      run: |
+        set -euo pipefail
+        errors=0
+        if [[ -z "$BASE_SHA" || -z "$HEAD_SHA" ]]; then
+          echo "::error::pull_request イベントで実行してください（PR のベース・ヘッドのコミットが取得できません）"
+          errors=1
+        fi
+        if ! command -v betterleaks > /dev/null; then
+          echo "::error::betterleaks が見つかりません。このアクションの前にインストールしてください"
+          errors=1
+        fi
+        if [[ "$(git rev-parse --is-shallow-repository 2> /dev/null)" != "false" ]]; then
+          echo "::error::Git の履歴がありません。actions/checkout で fetch-depth: 0 を指定してください"
+          errors=1
+        fi
+        exit "$errors"
+
+    - name: Run betterleaks
+      shell: bash
+      env:
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      run: |
+        set -euo pipefail
+        betterleaks version
+        MERGE_BASE=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+        betterleaks git --redact --verbose --no-banner \
+          --log-opts="--no-merges ${MERGE_BASE}..${HEAD_SHA}"

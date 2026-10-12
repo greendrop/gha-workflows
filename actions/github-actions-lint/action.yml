@@ -1,0 +1,90 @@
+---
+# actionlint・ghalint・zizmor で GitHub Actions の静的解析をする（composite action）
+#
+# - actionlint: https://github.com/rhysd/actionlint
+# - ghalint: https://github.com/suzuki-shunsuke/ghalint
+# - zizmor: https://github.com/zizmorcore/zizmor
+# - 呼び出し側で事前に用意するもの:
+#   - actions/checkout
+#   - 有効にしたツール（mise-action など、リポジトリに合った方法でインストールする）
+#
+# 呼び出し例:
+#   steps:
+#     - uses: actions/checkout@<sha> # vX.Y.Z
+#       with:
+#         persist-credentials: false
+#     - uses: jdx/mise-action@<sha> # vX.Y.Z
+#     - uses: greendrop/gha-workflows/actions/github-actions-lint@<sha> # vX.Y.Z
+#       with:
+#         zizmor: false # 使わないツールは false にする
+name: github-actions-lint
+description: actionlint・ghalint・zizmor で GitHub Actions の静的解析をする
+
+inputs:
+  actionlint:
+    description: actionlint を実行するか
+    required: false
+    default: "true"
+  ghalint:
+    description: ghalint を実行するか（ワークフローを対象にする ghalint run）
+    required: false
+    default: "true"
+  zizmor:
+    description: zizmor を実行するか
+    required: false
+    default: "true"
+  github-token:
+    description: zizmor のオンライン監査（既知の脆弱性・タグとコミットの不一致など）に使う GitHub のトークン
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check prerequisites
+      shell: bash
+      env:
+        ENABLE_ACTIONLINT: ${{ inputs.actionlint }}
+        ENABLE_GHALINT: ${{ inputs.ghalint }}
+        ENABLE_ZIZMOR: ${{ inputs.zizmor }}
+      run: |
+        set -euo pipefail
+        errors=0
+        for tool in actionlint ghalint zizmor; do
+          var="ENABLE_${tool^^}"
+          enabled="${!var}"
+          if [[ "$enabled" != "true" && "$enabled" != "false" ]]; then
+            echo "::error::inputs.${tool} は true / false で指定してください: ${enabled}"
+            errors=1
+          elif [[ "$enabled" == "true" ]] && ! command -v "$tool" > /dev/null; then
+            echo "::error::${tool} が見つかりません。このアクションの前にインストールするか、inputs.${tool} を false にしてください"
+            errors=1
+          fi
+        done
+        exit "$errors"
+
+    - name: Run actionlint
+      if: inputs.actionlint == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        actionlint -version
+        actionlint -color
+
+    - name: Run ghalint
+      if: inputs.ghalint == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        ghalint version
+        ghalint run
+
+    - name: Run zizmor
+      if: inputs.zizmor == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+        zizmor --version
+        zizmor --gh-token "$GH_TOKEN" .

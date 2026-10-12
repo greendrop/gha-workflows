@@ -16,7 +16,7 @@
   semanticCommits: "enabled",
   packageRules: [
     // GitHub Actions
-    // reusable workflow の中のアクションの更新は呼び出し側に届ける必要があるため、fix としてリリースする
+    // composite action・reusable workflow の中のアクションの更新は呼び出し側に届ける必要があるため、fix としてリリースする
     // （このリポジトリ用のワークフローだけの更新でもリリースされるが、区別しないで簡単にしておく）
     {
       matchManagers: ["github-actions"],
