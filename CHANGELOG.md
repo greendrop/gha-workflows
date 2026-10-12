@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.0](https://github.com/greendrop/gha-workflows/compare/v0.1.0...v0.2.0) (2026-10-12)
+
+
+### ⚠ BREAKING CHANGES
+
+* secret-scan を composite action にし、github-actions-lint を追加する ([#7](https://github.com/greendrop/gha-workflows/issues/7))
+
+### Features
+
+* secret-scan を composite action にし、github-actions-lint を追加する ([#7](https://github.com/greendrop/gha-workflows/issues/7)) ([04d3767](https://github.com/greendrop/gha-workflows/commit/04d376714631e49ef70157a05d24f9abaad2ce7e))
+
 ## 0.1.0 (2026-10-12)
 
 
