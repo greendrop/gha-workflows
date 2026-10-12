@@ -1,0 +1,31 @@
+---
+# PR タイトルが Conventional Commits の形式かをチェックする
+#
+# - squash merge で PR タイトルがコミットメッセージになり、release-please がそこからバージョンを決めるため
+# - https://github.com/amannn/action-semantic-pull-request
+name: repo-pr-title-lint
+
+on:
+  pull_request:
+    types:
+      - opened
+      - edited
+      - reopened
+      - synchronize
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  # github-terraform の ruleset で必須にしている
+  pr-title-lint:
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
+    permissions:
+      pull-requests: read
+    steps:
+      - name: Lint PR title
+        uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
