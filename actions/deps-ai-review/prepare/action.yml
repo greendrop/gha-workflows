@@ -1,0 +1,292 @@
+---
+# deps-ai-review の prepare ジョブ（composite action）
+#
+# Renovate の更新 PR を AI エージェントでレビューする deps-ai-review の 1 つ目のジョブ。
+# PR の状態を調べてレビューするかを決め、レビューするなら auto-merge を解除して pending ラベルを付ける。
+#
+# - 呼び出し側で事前に用意するもの:
+#   - pull_request イベント（types: opened / reopened / synchronize / labeled / unlabeled）
+#   - ジョブの permissions: contents / pull-requests / issues の write
+#   - actions/checkout（persist-credentials: false。依存を参照しているコード・パッチの有無を調べるため）
+# - 後続の review・finalize ジョブには、データを artifact（deps-ai-review-prepare）で渡す
+#
+# 呼び出し例は README を参照
+name: deps-ai-review-prepare
+description: deps-ai-review の prepare ジョブ。PR の状態を調べてレビューするかを決める
+
+inputs:
+  app-client-id:
+    description: AI レビュー用の GitHub App の Client ID（任意。未指定なら GITHUB_TOKEN を使う）
+    required: false
+    default: ""
+  app-private-key:
+    description: AI レビュー用の GitHub App の秘密鍵（任意）
+    required: false
+    default: ""
+  github-token:
+    description: GitHub App を使わないときのトークン（contents / pull-requests / issues の write）
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  target:
+    description: レビュー対象の PR か（true / false）。true のときは finalize ジョブを実行する
+    value: ${{ steps.pr.outputs.target == 'true' }}
+  mode:
+    description: "manual: 人が deps-ai-review:pass を付けた / reuse: 差分が前回と同じ / review: AI エージェントでレビューする"
+    value: ${{ steps.decide.outputs.mode }}
+  review-needed:
+    description: AI エージェントでレビューするか（true / false）。true のときは review ジョブを実行する
+    value: ${{ steps.decide.outputs.mode == 'review' && steps.guard.outputs.hit != 'true' }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check prerequisites
+      shell: bash
+      env:
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        set -euo pipefail
+        errors=0
+        if [[ -z "$PR_NUMBER" ]]; then
+          echo "::error::pull_request イベントで実行してください"
+          errors=1
+        fi
+        if ! git -C "$GITHUB_WORKSPACE" rev-parse --git-dir > /dev/null 2>&1; then
+          echo "::error::リポジトリが checkout されていません。このアクションの前に actions/checkout を実行してください"
+          errors=1
+        fi
+        exit "$errors"
+
+    # フォークの PR・処理しないラベルの付け外しでは何もしない（呼び出し側のジョブの if で絞ってもよい）
+    - name: Check event
+      id: event
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        LIB: ${{ github.action_path }}/../lib.cjs
+      with:
+        script: |
+          const lib = require(process.env.LIB)
+          const relevant = lib.isRelevantEvent({ payload: context.payload, repository: process.env.GITHUB_REPOSITORY })
+          core.setOutput('relevant', String(relevant))
+          core.info(relevant ? '処理するイベントです' : '処理しないイベントのため終了します')
+
+    # GITHUB_TOKEN で有効にした auto-merge では、マージ後の push で他のワークフローが起動しないため、
+    # GitHub App が設定されていればそのトークンを使う
+    # ステップの if では inputs の秘密情報の有無を直接参照しにくいため、GitHub App が設定されているかを先に調べる
+    - name: Check GitHub App configuration
+      id: app-config
+      if: steps.event.outputs.relevant == 'true'
+      shell: bash
+      env:
+        CLIENT_ID: ${{ inputs.app-client-id }}
+      run: |
+        if [[ -n "$CLIENT_ID" ]]; then
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "enabled=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Generate GitHub App token
+      id: app-token
+      if: steps.app-config.outputs.enabled == 'true'
+      uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+      with:
+        client-id: ${{ inputs.app-client-id }}
+        private-key: ${{ inputs.app-private-key }}
+        permission-contents: write
+        permission-pull-requests: write
+        permission-issues: write
+
+    # 前回のレビューコメントは、このワークフローのボットが書いたものだけを信頼する
+    - name: Resolve bot login
+      if: steps.event.outputs.relevant == 'true'
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        LIB: ${{ github.action_path }}/../lib.cjs
+        APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+      with:
+        script: |
+          const lib = require(process.env.LIB)
+          lib.writeJson('bot.json', { login: process.env.APP_SLUG ? `${process.env.APP_SLUG}[bot]` : 'github-actions[bot]' })
+
+    # opened 直後の payload にはラベルがまだ無いことがあるため、PR の最新状態を API で取得する
+    - name: Fetch pull request
+      id: pr
+      if: steps.event.outputs.relevant == 'true'
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        LIB: ${{ github.action_path }}/../lib.cjs
+      with:
+        github-token: ${{ steps.app-token.outputs.token || inputs.github-token }}
+        script: |
+          const lib = require(process.env.LIB)
+          await lib.run({ github, context, core }, async (ops) => {
+            const pr = await ops.fetchPr()
+            const open = pr.state === 'open'
+            const target = open && lib.isTarget(pr)
+            core.setOutput('head-sha', pr.head.sha)
+            core.setOutput('target', String(target))
+            core.setOutput('has-retry', String(pr.labels.some((l) => l.name === lib.RETRY_LABEL)))
+            core.setOutput('manual-merge', String(pr.labels.some((l) => l.name === lib.MANUAL_MERGE_LABEL)))
+            lib.writeJson('pr.json', { title: pr.title, body: pr.body || '' })
+            core.info(open ? `レビュー対象: ${target}` : 'PR が closed のため終了します')
+          })
+
+    - name: Compute diff fingerprint
+      id: fingerprint
+      if: steps.pr.outputs.target == 'true'
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        LIB: ${{ github.action_path }}/../lib.cjs
+      with:
+        github-token: ${{ steps.app-token.outputs.token || inputs.github-token }}
+        script: |
+          const lib = require(process.env.LIB)
+          await lib.run({ github, context, core }, async (ops) => {
+            const files = (await ops.listFiles()).map((f) => ({
+              filename: f.filename,
+              previous_filename: f.previous_filename,
+              status: f.status,
+              sha: f.sha,
+              patch: f.patch
+            }))
+            lib.writeJson('files.json', files)
+            const fp = lib.computeFingerprint(files)
+            core.setOutput('fp', fp)
+            core.info(`fingerprint: ${fp}`)
+          })
+
+    - name: Find previous review comment
+      id: previous
+      if: steps.pr.outputs.target == 'true'
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        LIB: ${{ github.action_path }}/../lib.cjs
+      with:
+        github-token: ${{ steps.app-token.outputs.token || inputs.github-token }}
+        script: |
+          const lib = require(process.env.LIB)
+          await lib.run({ github, context, core }, async (ops) => {
+            const previous = lib.findPreviousComment(await ops.listComments())
+            core.setOutput('fp', previous?.fp ?? '')
+            core.setOutput('verdict', previous?.verdict ?? '')
+            lib.writeJson('previous.json', previous?.data ?? null)
+            core.info(previous ? `前回: fp=${previous.fp} verdict=${previous.verdict}` : '前回のレビューなし')
+          })
+
+    # manual: 人が deps-ai-review:pass を付けた / reuse: 差分が前回と同じ / review: AI エージェントでレビューする
+    - name: Decide review mode
+      id: decide
+      if: steps.pr.outputs.target == 'true'
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        LIB: ${{ github.action_path }}/../lib.cjs
+        HAS_RETRY: ${{ steps.pr.outputs.has-retry }}
+        FP: ${{ steps.fingerprint.outputs.fp }}
+        PREVIOUS_FP: ${{ steps.previous.outputs.fp }}
+        PREVIOUS_VERDICT: ${{ steps.previous.outputs.verdict }}
+      with:
+        script: |
+          const lib = require(process.env.LIB)
+          const mode = lib.decideMode({
+            payload: context.payload,
+            hasRetry: process.env.HAS_RETRY === 'true',
+            fp: process.env.FP,
+            previousFp: process.env.PREVIOUS_FP,
+            previousVerdict: process.env.PREVIOUS_VERDICT
+          })
+          core.setOutput('mode', mode)
+          core.info(`mode: ${mode}`)
+
+    # 古い結果でマージされないよう、レビュー前に auto-merge を解除し、pending ラベルを付ける
+    - name: Block merge during review
+      if: steps.decide.outputs.mode == 'review'
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        LIB: ${{ github.action_path }}/../lib.cjs
+      with:
+        github-token: ${{ steps.app-token.outputs.token || inputs.github-token }}
+        script: |
+          const lib = require(process.env.LIB)
+          await lib.run({ github, context, core }, async (ops) => {
+            await ops.disableAutoMerge()
+            await ops.setStateLabel(lib.STATE_LABELS.pending)
+          })
+
+    # 更新された依存・パッチや overrides の有無・依存を参照しているコードを集める
+    - name: Collect dependency context
+      if: steps.decide.outputs.mode == 'review'
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        LIB: ${{ github.action_path }}/../lib.cjs
+      with:
+        script: |
+          const lib = require(process.env.LIB)
+          await lib.run({ github, context, core }, async () => {
+            const repoDir = process.env.GITHUB_WORKSPACE
+            const dependencies = lib.extractUpdatedDependencies(lib.readJson('files.json', []))
+            const names = dependencies.map((d) => d.name)
+            const patched = lib.findPatchedDependencies({ repoDir, names })
+            const usage = lib.collectUsage({ repoDir, names })
+            lib.writeJson('context.json', { dependencies, patched, usage })
+            core.info(`更新された依存: ${names.join(', ') || '（特定できず）'}`)
+            core.info(`参照しているコード: ${usage.files.join(', ') || '（なし）'}`)
+          })
+
+    # 確実に止めたいケース（パッチや overrides / resolutions が当たっている依存の更新）は、AI 任せにせず人の確認に回す
+    - name: Check guard conditions
+      id: guard
+      if: steps.decide.outputs.mode == 'review'
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        LIB: ${{ github.action_path }}/../lib.cjs
+      with:
+        script: |
+          const lib = require(process.env.LIB)
+          await lib.run({ github, context, core }, async () => {
+            const { dependencies, patched, usage } = lib.readJson('context.json')
+            const reasons = lib.evaluateGuards({ patched })
+            core.setOutput('hit', String(reasons.length > 0))
+            if (reasons.length === 0) return
+            lib.writeJson('review.json', { ...lib.buildGuardReview(reasons), dependencies, context_files: usage.files })
+            for (const reason of reasons) core.info(`ガード条件: ${reason}`)
+          })
+
+    # finalize に渡す値を保存する。completed が無ければ、finalize は prepare が途中で失敗したとみなして error を反映する
+    - name: Save state
+      if: steps.pr.outputs.target == 'true'
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        LIB: ${{ github.action_path }}/../lib.cjs
+        HEAD_SHA: ${{ steps.pr.outputs.head-sha }}
+        MANUAL_MERGE: ${{ steps.pr.outputs.manual-merge }}
+        FP: ${{ steps.fingerprint.outputs.fp }}
+        PREVIOUS_VERDICT: ${{ steps.previous.outputs.verdict }}
+        MODE: ${{ steps.decide.outputs.mode }}
+      with:
+        script: |
+          const lib = require(process.env.LIB)
+          lib.writeJson('state.json', {
+            completed: true,
+            headSha: process.env.HEAD_SHA,
+            manualMerge: process.env.MANUAL_MERGE === 'true',
+            fp: process.env.FP,
+            previousVerdict: process.env.PREVIOUS_VERDICT,
+            mode: process.env.MODE
+          })
+
+    # 後続のジョブにデータ（PR の情報・差分・前回の結果・エラー内容など）を渡す
+    # bot.json は渡さない（finalize が自分のトークンから決め直す）
+    - name: Upload prepared data
+      if: always() && steps.pr.outputs.target == 'true'
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: deps-ai-review-prepare
+        path: |
+          ${{ runner.temp }}/deps-ai-review
+          !${{ runner.temp }}/deps-ai-review/bot.json
+        retention-days: 1
+        if-no-files-found: ignore
+        overwrite: true

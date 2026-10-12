@@ -35,4 +35,4 @@ jobs:
 
       # composite action は actions/github-actions-lint の対象外（ghalint run はワークフローだけを見る）なので、ここで lint する
       - name: Run ghalint for composite actions
-        run: ghalint run-action actions/*/action.yml
+        run: ghalint run-action actions/*/action.yml actions/*/*/action.yml
