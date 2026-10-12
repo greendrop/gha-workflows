@@ -31,9 +31,9 @@ jobs:
           client-id: ${{ secrets.GH_APPS_PULL_REQUEST_CREATE_CLIENT_ID }}
           private-key: ${{ secrets.GH_APPS_PULL_REQUEST_CREATE_PRIVATE_KEY }}
           permission-contents: write
+          # リリース PR のラベル（autorelease: pending など）の作成・付け替えも pull-requests の権限で行える
+          # （PR 作成用の GitHub App には issues の権限が無いため要求しない）
           permission-pull-requests: write
-          # リリース PR のラベル（autorelease: pending など）を作成・付け替えるため
-          permission-issues: write
 
       - name: Run release-please
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
