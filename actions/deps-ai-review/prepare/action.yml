@@ -1,0 +1,286 @@
+---
+# Renovate の更新 PR を AI エージェントでレビューする deps-ai-review の前半（composite action）
+#
+# PR の状態を調べてレビューするかを決め、レビューするなら auto-merge を解除して pending ラベルを付ける。
+# 同じジョブで、このあとに依存のインストール（必要なときだけ）と actions/deps-ai-review/review を実行する。
+#
+# - 判定結果はラベル（deps-ai-review:*）と PR コメントで表す
+# - Renovate がレビュー対象の PR に deps-ai-review:pending を付ける（対象の条件は Renovate の設定で指定する）
+# - 書き込み（ラベル・auto-merge）は GitHub App のトークンで行い、使い終わったらすぐに無効にする
+#   （このあとの AI エージェントの実行中に、書き込みのできるトークンを残さないため）
+# - 呼び出し側で事前に用意するもの:
+#   - pull_request イベント（types: opened / reopened / synchronize / labeled / unlabeled）
+#   - ジョブの permissions は読み取りだけ（contents / pull-requests / issues: read）
+#   - actions/checkout（persist-credentials: false）
+#   - AI レビュー用の GitHub App（Contents・Pull requests・Issues の Read and write）
+#
+# 呼び出し例は README を参照
+name: deps-ai-review-prepare
+description: deps-ai-review の前半。PR の状態を調べてレビューするかを決める
+
+inputs:
+  app-client-id:
+    description: AI レビュー用の GitHub App の Client ID
+    required: true
+  app-private-key:
+    description: AI レビュー用の GitHub App の秘密鍵
+    required: true
+
+outputs:
+  target:
+    description: レビュー対象の PR か（true / false）。true のときは actions/deps-ai-review/review を実行する
+    value: ${{ steps.pr.outputs.target == 'true' }}
+  mode:
+    description: "manual: 人が deps-ai-review:pass を付けた / reuse: 差分が前回と同じ / review: AI エージェントでレビューする"
+    value: ${{ steps.decide.outputs.mode }}
+  review-needed:
+    description: AI エージェントでレビューするか（true / false）。true のときだけ依存をインストールすればよい
+    value: ${{ steps.decide.outputs.mode == 'review' && steps.guard.outputs.hit != 'true' }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check prerequisites
+      shell: bash
+      env:
+        APP_CLIENT_ID: ${{ inputs.app-client-id }}
+        APP_PRIVATE_KEY: ${{ inputs.app-private-key }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        set -euo pipefail
+        errors=0
+        if [[ -z "$PR_NUMBER" ]]; then
+          echo "::error::pull_request イベントで実行してください"
+          errors=1
+        fi
+        if ! git -C "$GITHUB_WORKSPACE" rev-parse --git-dir > /dev/null 2>&1; then
+          echo "::error::リポジトリが checkout されていません。このアクションの前に actions/checkout を実行してください"
+          errors=1
+        fi
+        if [[ -z "$APP_CLIENT_ID" || -z "$APP_PRIVATE_KEY" ]]; then
+          echo "::error::app-client-id / app-private-key を指定してください（AI レビュー用の GitHub App）"
+          errors=1
+        fi
+        # 前回の実行のデータを残さない（同じランナーで続けて実行された場合に備える）
+        rm -rf "$RUNNER_TEMP/deps-ai-review"
+        exit "$errors"
+
+    - name: Check event
+      id: event
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        LIB: ${{ github.action_path }}/../lib.cjs
+      with:
+        script: |
+          const lib = require(process.env.LIB)
+          const relevant = lib.isRelevantEvent({ payload: context.payload, repository: process.env.GITHUB_REPOSITORY })
+          core.setOutput('relevant', String(relevant))
+          core.info(relevant ? '処理するイベントです' : '処理しないイベントのため終了します')
+
+    # GITHUB_TOKEN で有効にした auto-merge では、マージ後の push で他のワークフローが起動しないため、GitHub App を使う
+    # このトークンは「Revoke GitHub App token」ですぐに無効にする
+    # （action の後処理はジョブの終了時で AI エージェントの実行より後になるため、使わない。使うと二重に無効化して警告が出る）
+    - name: Generate GitHub App token
+      id: app-token
+      if: steps.event.outputs.relevant == 'true'
+      uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+      with:
+        client-id: ${{ inputs.app-client-id }}
+        private-key: ${{ inputs.app-private-key }}
+        permission-contents: read
+        permission-pull-requests: write
+        permission-issues: write
+        skip-token-revoke: true # zizmor: ignore[github-app] 「Revoke GitHub App token」で無効にする
+
+    # 前回のレビューコメントは、この GitHub App が書いたものだけを信頼する（review でも使うので、ファイルに保存する）
+    - name: Resolve bot login
+      if: steps.event.outputs.relevant == 'true'
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        LIB: ${{ github.action_path }}/../lib.cjs
+        APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+      with:
+        script: |
+          const lib = require(process.env.LIB)
+          lib.writeJson('bot.json', { login: `${process.env.APP_SLUG}[bot]` })
+
+    # opened 直後の payload にはラベルがまだ無いことがあるため、PR の最新状態を API で取得する
+    - name: Fetch pull request
+      id: pr
+      if: steps.event.outputs.relevant == 'true'
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        LIB: ${{ github.action_path }}/../lib.cjs
+      with:
+        github-token: ${{ steps.app-token.outputs.token }}
+        script: |
+          const lib = require(process.env.LIB)
+          await lib.run({ github, context, core }, async (ops) => {
+            const pr = await ops.fetchPr()
+            const open = pr.state === 'open'
+            const target = open && lib.isTarget(pr)
+            core.setOutput('head-sha', pr.head.sha)
+            core.setOutput('target', String(target))
+            core.setOutput('has-retry', String(pr.labels.some((l) => l.name === lib.RETRY_LABEL)))
+            core.setOutput('manual-merge', String(pr.labels.some((l) => l.name === lib.MANUAL_MERGE_LABEL)))
+            lib.writeJson('pr.json', { title: pr.title, body: pr.body || '' })
+            core.info(open ? `レビュー対象: ${target}` : 'PR が closed のため終了します')
+          })
+
+    - name: Compute diff fingerprint
+      id: fingerprint
+      if: steps.pr.outputs.target == 'true'
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        LIB: ${{ github.action_path }}/../lib.cjs
+      with:
+        github-token: ${{ steps.app-token.outputs.token }}
+        script: |
+          const lib = require(process.env.LIB)
+          await lib.run({ github, context, core }, async (ops) => {
+            const files = (await ops.listFiles()).map((f) => ({
+              filename: f.filename,
+              previous_filename: f.previous_filename,
+              status: f.status,
+              sha: f.sha,
+              patch: f.patch
+            }))
+            lib.writeJson('files.json', files)
+            const fp = lib.computeFingerprint(files)
+            core.setOutput('fp', fp)
+            core.info(`fingerprint: ${fp}`)
+          })
+
+    - name: Find previous review comment
+      id: previous
+      if: steps.pr.outputs.target == 'true'
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        LIB: ${{ github.action_path }}/../lib.cjs
+      with:
+        github-token: ${{ steps.app-token.outputs.token }}
+        script: |
+          const lib = require(process.env.LIB)
+          await lib.run({ github, context, core }, async (ops) => {
+            const previous = lib.findPreviousComment(await ops.listComments())
+            core.setOutput('fp', previous?.fp ?? '')
+            core.setOutput('verdict', previous?.verdict ?? '')
+            lib.writeJson('previous.json', previous?.data ?? null)
+            core.info(previous ? `前回: fp=${previous.fp} verdict=${previous.verdict}` : '前回のレビューなし')
+          })
+
+    # manual: 人が deps-ai-review:pass を付けた / reuse: 差分が前回と同じ / review: AI エージェントでレビューする
+    - name: Decide review mode
+      id: decide
+      if: steps.pr.outputs.target == 'true'
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        LIB: ${{ github.action_path }}/../lib.cjs
+        HAS_RETRY: ${{ steps.pr.outputs.has-retry }}
+        FP: ${{ steps.fingerprint.outputs.fp }}
+        PREVIOUS_FP: ${{ steps.previous.outputs.fp }}
+        PREVIOUS_VERDICT: ${{ steps.previous.outputs.verdict }}
+      with:
+        script: |
+          const lib = require(process.env.LIB)
+          const mode = lib.decideMode({
+            payload: context.payload,
+            hasRetry: process.env.HAS_RETRY === 'true',
+            fp: process.env.FP,
+            previousFp: process.env.PREVIOUS_FP,
+            previousVerdict: process.env.PREVIOUS_VERDICT
+          })
+          core.setOutput('mode', mode)
+          core.info(`mode: ${mode}`)
+
+    # 古い結果でマージされないよう、レビュー前に auto-merge を解除し、pending ラベルを付ける
+    - name: Block merge during review
+      if: steps.decide.outputs.mode == 'review'
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        LIB: ${{ github.action_path }}/../lib.cjs
+      with:
+        github-token: ${{ steps.app-token.outputs.token }}
+        script: |
+          const lib = require(process.env.LIB)
+          await lib.run({ github, context, core }, async (ops) => {
+            await ops.disableAutoMerge()
+            await ops.setStateLabel(lib.STATE_LABELS.pending)
+          })
+
+    # 更新された依存・パッチや overrides の有無・依存を参照しているコードを集める
+    - name: Collect dependency context
+      if: steps.decide.outputs.mode == 'review'
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        LIB: ${{ github.action_path }}/../lib.cjs
+      with:
+        script: |
+          const lib = require(process.env.LIB)
+          await lib.run({ github, context, core }, async () => {
+            const repoDir = process.env.GITHUB_WORKSPACE
+            const dependencies = lib.extractUpdatedDependencies(lib.readJson('files.json', []))
+            const names = dependencies.map((d) => d.name)
+            const patched = lib.findPatchedDependencies({ repoDir, names })
+            const usage = lib.collectUsage({ repoDir, names })
+            lib.writeJson('context.json', { dependencies, patched, usage })
+            core.info(`更新された依存: ${names.join(', ') || '（特定できず）'}`)
+            core.info(`参照しているコード: ${usage.files.join(', ') || '（なし）'}`)
+          })
+
+    # 確実に止めたいケース（パッチや overrides / resolutions が当たっている依存の更新）は、AI 任せにせず人の確認に回す
+    - name: Check guard conditions
+      id: guard
+      if: steps.decide.outputs.mode == 'review'
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        LIB: ${{ github.action_path }}/../lib.cjs
+      with:
+        script: |
+          const lib = require(process.env.LIB)
+          await lib.run({ github, context, core }, async () => {
+            const { dependencies, patched, usage } = lib.readJson('context.json')
+            const reasons = lib.evaluateGuards({ patched })
+            core.setOutput('hit', String(reasons.length > 0))
+            if (reasons.length === 0) return
+            lib.writeJson('review.json', { ...lib.buildGuardReview(reasons), dependencies, context_files: usage.files })
+            for (const reason of reasons) core.info(`ガード条件: ${reason}`)
+          })
+
+    # review に渡す値を保存する。completed が無ければ、review は prepare が途中で失敗したとみなして error を反映する
+    - name: Save state
+      if: steps.pr.outputs.target == 'true'
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        LIB: ${{ github.action_path }}/../lib.cjs
+        HEAD_SHA: ${{ steps.pr.outputs.head-sha }}
+        MANUAL_MERGE: ${{ steps.pr.outputs.manual-merge }}
+        FP: ${{ steps.fingerprint.outputs.fp }}
+        PREVIOUS_VERDICT: ${{ steps.previous.outputs.verdict }}
+        MODE: ${{ steps.decide.outputs.mode }}
+        GUARD_HIT: ${{ steps.guard.outputs.hit }}
+      with:
+        script: |
+          const lib = require(process.env.LIB)
+          lib.writeJson('state.json', {
+            completed: true,
+            headSha: process.env.HEAD_SHA,
+            manualMerge: process.env.MANUAL_MERGE === 'true',
+            fp: process.env.FP,
+            previousVerdict: process.env.PREVIOUS_VERDICT,
+            mode: process.env.MODE,
+            guardHit: process.env.GUARD_HIT === 'true'
+          })
+
+    # 失敗しても必ず無効にする
+    - name: Revoke GitHub App token
+      if: always() && steps.app-token.outputs.token != ''
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        LIB: ${{ github.action_path }}/../lib.cjs
+      with:
+        github-token: ${{ steps.app-token.outputs.token }}
+        script: |
+          const lib = require(process.env.LIB)
+          await lib.createOps({ github, context, core }).revokeToken()
+          core.info('GitHub App のトークンを無効にしました')
