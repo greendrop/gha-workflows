@@ -22,7 +22,7 @@
 |---|---|---|
 | [`secret-scan`](actions/secret-scan/action.yml) | betterleaks で PR の差分コミットから秘密情報を検出する | checkout（`fetch-depth: 0`）、betterleaks |
 | [`github-actions-lint`](actions/github-actions-lint/action.yml) | actionlint・ghalint・zizmor で GitHub Actions を静的解析する（ツールごとに inputs で無効にできる） | checkout、有効にしたツール |
-| [`deps-ai-review/prepare`](actions/deps-ai-review/prepare/action.yml)・[`deps-ai-review/review`](actions/deps-ai-review/review/action.yml) | Renovate の更新 PR を AI エージェントでレビューし、判定結果をラベル・auto-merge・PR コメントに反映する（[deps-ai-review](#deps-ai-review)） | checkout、AI レビュー用の GitHub App、Claude の OAuth トークン、依存のインストール（任意） |
+| [`deps-ai-review/prepare`](actions/deps-ai-review/prepare/action.yml)・[`review`](actions/deps-ai-review/review/action.yml)・[`finalize`](actions/deps-ai-review/finalize/action.yml) | Renovate の更新 PR を AI エージェントでレビューし、判定結果をラベル・auto-merge・PR コメントに反映する（3 つのジョブで使う。[deps-ai-review](#deps-ai-review)） | checkout、Claude の OAuth トークン、依存のインストール（任意）、AI レビュー用の GitHub App（任意） |
 
 `.github/workflows/` の `repo-` で始まるワークフローは、このリポジトリ自身の CI・リリース用（呼び出し側からは使わない）。
 
@@ -62,13 +62,14 @@ reusable workflow を追加したときの注意:
 
 Renovate の更新 PR を AI エージェント（[anthropics/claude-code-action](https://github.com/anthropics/claude-code-action)）でレビューし、pass なら auto-merge を有効にする。
 
-- 1 つのジョブで `prepare` → 依存のインストール（レビューするときだけ） → `review` の順に実行する
-- 判定結果はラベル（`deps-ai-review:*`）と PR コメントで表す。対象の PR には Renovate が `deps-ai-review:pending` を付ける
-- AI エージェントには書き込み権限を渡さない
-  - ジョブの `permissions` は読み取りだけにする（ジョブの GITHUB_TOKEN を AI エージェントに渡す）
-  - ラベル・コメント・auto-merge は GitHub App のトークンで書き込む。`prepare` で作ったトークンは AI エージェントの実行前に無効にし、`review` では AI エージェントの実行後にトークンを作る
-  - AI エージェントには読み取り系のツール（Read・Grep・Glob）だけを許可する
-- 依存のインストールは呼び出し側で行う（パッケージマネージャー・ツールの準備はリポジトリごとに違うため）。インストールできると、AI エージェントが新しいバージョンの CHANGELOG・型定義などを読める
+- 3 つのジョブに分け、AI エージェントには書き込み権限を渡さない
+  - `prepare`: PR の状態を調べ、レビューするかを決める（書き込み権限あり）
+  - `review`: AI エージェントがレビューする（読み取り権限だけ）
+  - `finalize`: 判定結果をラベル・auto-merge・コメントに反映する（書き込み権限あり）
+- それぞれのジョブの処理を composite action（`actions/deps-ai-review/prepare`・`review`・`finalize`）にしている。ジョブの構成・permissions・checkout・依存のインストールは呼び出し側に書く（パッケージマネージャー・ツールの準備はリポジトリごとに違うため）
+- ジョブ間のデータは artifact（`deps-ai-review-prepare`・`deps-ai-review-review`）で受け渡す
+- 判定結果はラベル（`deps-ai-review:*`）と PR コメントで表す（コミットステータスは付けない。CI のチェックと並ぶと失敗したように見えて紛らわしいため）
+- AI レビュー用の GitHub App を指定すると、そのトークンでラベル・コメント・auto-merge を操作する（GITHUB_TOKEN で有効にした auto-merge では、マージ後の push で他のワークフローが起動しないため）。指定しなければ GITHUB_TOKEN を使う
 
 ```yaml
 name: deps-ai-review
@@ -88,10 +89,32 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  deps-ai-review:
+  prepare:
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    outputs:
+      target: ${{ steps.prepare.outputs.target }}
+      review-needed: ${{ steps.prepare.outputs.review-needed }}
+    steps:
+      - uses: actions/checkout@<sha> # vX.Y.Z
+        with:
+          persist-credentials: false
+      - id: prepare
+        uses: greendrop/gha-workflows/actions/deps-ai-review/prepare@<sha> # vX.Y.Z
+        with:
+          app-client-id: ${{ secrets.GH_APPS_AI_REVIEW_CLIENT_ID }}
+          app-private-key: ${{ secrets.GH_APPS_AI_REVIEW_PRIVATE_KEY }}
+
+  review:
+    needs: prepare
+    if: needs.prepare.outputs.review-needed == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # 読み取りだけにする（書き込みは GitHub App のトークンで行う）
+    # AI エージェントには読み取り権限だけを渡す
     permissions:
       contents: read
       pull-requests: read
@@ -100,46 +123,53 @@ jobs:
       - uses: actions/checkout@<sha> # vX.Y.Z
         with:
           persist-credentials: false
-
-      - id: prepare
-        uses: greendrop/gha-workflows/actions/deps-ai-review/prepare@<sha> # vX.Y.Z
-        with:
-          app-client-id: ${{ secrets.GH_APPS_AI_REVIEW_CLIENT_ID }}
-          app-private-key: ${{ secrets.GH_APPS_AI_REVIEW_PRIVATE_KEY }}
-
-      # レビューするときだけ依存をインストールする（失敗してもレビューは続ける。インストールスクリプトは実行しない）
+      # 依存をインストールする（失敗してもレビューは続ける。インストールスクリプトは実行しない）
       - id: mise
-        if: steps.prepare.outputs.review-needed == 'true'
         continue-on-error: true
         uses: jdx/mise-action@<sha> # vX.Y.Z
       - id: install
         if: steps.mise.outcome == 'success'
         continue-on-error: true
         run: pnpm install --frozen-lockfile --ignore-scripts
-
-      # prepare が途中で失敗したときも、error を反映するために実行する
-      - if: always() && steps.prepare.outputs.target == 'true'
-        uses: greendrop/gha-workflows/actions/deps-ai-review/review@<sha> # vX.Y.Z
+      - uses: greendrop/gha-workflows/actions/deps-ai-review/review@<sha> # vX.Y.Z
         with:
           claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          app-client-id: ${{ secrets.GH_APPS_AI_REVIEW_CLIENT_ID }}
-          app-private-key: ${{ secrets.GH_APPS_AI_REVIEW_PRIVATE_KEY }}
           dependencies-installed: ${{ steps.install.outcome == 'success' }}
           instructions: Nuxt 4 のアプリです。nuxt.config.ts の modules も依存の使用箇所として確認してください
           claude-model: ${{ vars.DEPS_AI_REVIEW_CLAUDE_MODEL }}
+
+  finalize:
+    needs:
+      - prepare
+      - review
+    # prepare・review が失敗・キャンセルされても実行し、error を反映する
+    if: always() && needs.prepare.outputs.target == 'true'
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: greendrop/gha-workflows/actions/deps-ai-review/finalize@<sha> # vX.Y.Z
+        with:
+          review-result: ${{ needs.review.result }}
+          app-client-id: ${{ secrets.GH_APPS_AI_REVIEW_CLIENT_ID }}
+          app-private-key: ${{ secrets.GH_APPS_AI_REVIEW_PRIVATE_KEY }}
           auto-merge: ${{ vars.DEPS_AI_REVIEW_AUTO_MERGE }}
           merge-method: ${{ vars.DEPS_AI_REVIEW_MERGE_METHOD || 'MERGE' }}
 ```
 
-| 設定 | 内容 |
-|---|---|
-| `app-client-id` / `app-private-key` | AI レビュー用の GitHub App（Contents・Pull requests・Issues の Read and write）。必須 |
-| `claude-code-oauth-token` | Claude の OAuth トークン（Pro / Max プランで `claude setup-token` で発行）。必須 |
-| `dependencies-installed` | 依存をインストールできたか（AI エージェントにインストール先のファイルも読むよう伝える） |
-| `instructions` | AI エージェントに伝える、このリポジトリについての補足 |
-| `claude-model` | モデル（未指定なら Claude Code の既定） |
-| `auto-merge` | `true` で AI が approve した PR を自動マージする（既定値: 無効。導入初期はレビューだけさせて判断を確認する） |
-| `merge-method` | 自動マージのマージ方法（MERGE / SQUASH / REBASE。既定値: MERGE） |
+| action | 設定 | 内容 |
+|---|---|---|
+| prepare・finalize | `app-client-id` / `app-private-key` | AI レビュー用の GitHub App（Contents・Pull requests・Issues の Read and write）。任意 |
+| review | `claude-code-oauth-token` | Claude の OAuth トークン（Pro / Max プランで `claude setup-token` で発行）。必須 |
+| review | `dependencies-installed` | 依存をインストールできたか（AI エージェントにインストール先のファイルも読むよう伝える） |
+| review | `instructions` | AI エージェントに伝える、このリポジトリについての補足 |
+| review | `claude-model` | モデル（未指定なら Claude Code の既定） |
+| finalize | `review-result` | review ジョブの結果（`needs.review.result`）。必須 |
+| finalize | `auto-merge` | `true` で AI が approve した PR を自動マージする（既定値: 無効。導入初期はレビューだけさせて判断を確認する） |
+| finalize | `merge-method` | 自動マージのマージ方法（MERGE / SQUASH / REBASE。既定値: MERGE） |
 
 Renovate の設定で、レビュー対象の PR に `deps-ai-review:pending` を付ける。自動マージしない PR には `deps-ai-review:manual-merge` も付ける。
 

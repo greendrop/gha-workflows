@@ -1,40 +1,42 @@
 ---
-# Renovate の更新 PR を AI エージェントでレビューする deps-ai-review の前半（composite action）
+# deps-ai-review の prepare ジョブ（composite action）
 #
+# Renovate の更新 PR を AI エージェントでレビューする deps-ai-review の 1 つ目のジョブ。
 # PR の状態を調べてレビューするかを決め、レビューするなら auto-merge を解除して pending ラベルを付ける。
-# 同じジョブで、このあとに依存のインストール（必要なときだけ）と actions/deps-ai-review/review を実行する。
 #
-# - 判定結果はラベル（deps-ai-review:*）と PR コメントで表す
-# - Renovate がレビュー対象の PR に deps-ai-review:pending を付ける（対象の条件は Renovate の設定で指定する）
-# - 書き込み（ラベル・auto-merge）は GitHub App のトークンで行い、使い終わったらすぐに無効にする
-#   （このあとの AI エージェントの実行中に、書き込みのできるトークンを残さないため）
 # - 呼び出し側で事前に用意するもの:
 #   - pull_request イベント（types: opened / reopened / synchronize / labeled / unlabeled）
-#   - ジョブの permissions は読み取りだけ（contents / pull-requests / issues: read）
-#   - actions/checkout（persist-credentials: false）
-#   - AI レビュー用の GitHub App（Contents・Pull requests・Issues の Read and write）
+#   - ジョブの permissions: contents / pull-requests / issues の write
+#   - actions/checkout（persist-credentials: false。依存を参照しているコード・パッチの有無を調べるため）
+# - 後続の review・finalize ジョブには、データを artifact（deps-ai-review-prepare）で渡す
 #
 # 呼び出し例は README を参照
 name: deps-ai-review-prepare
-description: deps-ai-review の前半。PR の状態を調べてレビューするかを決める
+description: deps-ai-review の prepare ジョブ。PR の状態を調べてレビューするかを決める
 
 inputs:
   app-client-id:
-    description: AI レビュー用の GitHub App の Client ID
-    required: true
+    description: AI レビュー用の GitHub App の Client ID（任意。未指定なら GITHUB_TOKEN を使う）
+    required: false
+    default: ""
   app-private-key:
-    description: AI レビュー用の GitHub App の秘密鍵
-    required: true
+    description: AI レビュー用の GitHub App の秘密鍵（任意）
+    required: false
+    default: ""
+  github-token:
+    description: GitHub App を使わないときのトークン（contents / pull-requests / issues の write）
+    required: false
+    default: ${{ github.token }}
 
 outputs:
   target:
-    description: レビュー対象の PR か（true / false）。true のときは actions/deps-ai-review/review を実行する
+    description: レビュー対象の PR か（true / false）。true のときは finalize ジョブを実行する
     value: ${{ steps.pr.outputs.target == 'true' }}
   mode:
     description: "manual: 人が deps-ai-review:pass を付けた / reuse: 差分が前回と同じ / review: AI エージェントでレビューする"
     value: ${{ steps.decide.outputs.mode }}
   review-needed:
-    description: AI エージェントでレビューするか（true / false）。true のときだけ依存をインストールすればよい
+    description: AI エージェントでレビューするか（true / false）。true のときは review ジョブを実行する
     value: ${{ steps.decide.outputs.mode == 'review' && steps.guard.outputs.hit != 'true' }}
 
 runs:
@@ -43,8 +45,6 @@ runs:
     - name: Check prerequisites
       shell: bash
       env:
-        APP_CLIENT_ID: ${{ inputs.app-client-id }}
-        APP_PRIVATE_KEY: ${{ inputs.app-private-key }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
       run: |
         set -euo pipefail
@@ -57,14 +57,9 @@ runs:
           echo "::error::リポジトリが checkout されていません。このアクションの前に actions/checkout を実行してください"
           errors=1
         fi
-        if [[ -z "$APP_CLIENT_ID" || -z "$APP_PRIVATE_KEY" ]]; then
-          echo "::error::app-client-id / app-private-key を指定してください（AI レビュー用の GitHub App）"
-          errors=1
-        fi
-        # 前回の実行のデータを残さない（同じランナーで続けて実行された場合に備える）
-        rm -rf "$RUNNER_TEMP/deps-ai-review"
         exit "$errors"
 
+    # フォークの PR・処理しないラベルの付け外しでは何もしない（呼び出し側のジョブの if で絞ってもよい）
     - name: Check event
       id: event
       uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
@@ -77,22 +72,34 @@ runs:
           core.setOutput('relevant', String(relevant))
           core.info(relevant ? '処理するイベントです' : '処理しないイベントのため終了します')
 
-    # GITHUB_TOKEN で有効にした auto-merge では、マージ後の push で他のワークフローが起動しないため、GitHub App を使う
-    # このトークンは「Revoke GitHub App token」ですぐに無効にする
-    # （action の後処理はジョブの終了時で AI エージェントの実行より後になるため、使わない。使うと二重に無効化して警告が出る）
+    # GITHUB_TOKEN で有効にした auto-merge では、マージ後の push で他のワークフローが起動しないため、
+    # GitHub App が設定されていればそのトークンを使う
+    # ステップの if では inputs の秘密情報の有無を直接参照しにくいため、GitHub App が設定されているかを先に調べる
+    - name: Check GitHub App configuration
+      id: app-config
+      if: steps.event.outputs.relevant == 'true'
+      shell: bash
+      env:
+        CLIENT_ID: ${{ inputs.app-client-id }}
+      run: |
+        if [[ -n "$CLIENT_ID" ]]; then
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "enabled=false" >> "$GITHUB_OUTPUT"
+        fi
+
     - name: Generate GitHub App token
       id: app-token
-      if: steps.event.outputs.relevant == 'true'
+      if: steps.app-config.outputs.enabled == 'true'
       uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
       with:
         client-id: ${{ inputs.app-client-id }}
         private-key: ${{ inputs.app-private-key }}
-        permission-contents: read
+        permission-contents: write
         permission-pull-requests: write
         permission-issues: write
-        skip-token-revoke: true # zizmor: ignore[github-app] 「Revoke GitHub App token」で無効にする
 
-    # 前回のレビューコメントは、この GitHub App が書いたものだけを信頼する（review でも使うので、ファイルに保存する）
+    # 前回のレビューコメントは、このワークフローのボットが書いたものだけを信頼する
     - name: Resolve bot login
       if: steps.event.outputs.relevant == 'true'
       uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
@@ -102,7 +109,7 @@ runs:
       with:
         script: |
           const lib = require(process.env.LIB)
-          lib.writeJson('bot.json', { login: `${process.env.APP_SLUG}[bot]` })
+          lib.writeJson('bot.json', { login: process.env.APP_SLUG ? `${process.env.APP_SLUG}[bot]` : 'github-actions[bot]' })
 
     # opened 直後の payload にはラベルがまだ無いことがあるため、PR の最新状態を API で取得する
     - name: Fetch pull request
@@ -112,7 +119,7 @@ runs:
       env:
         LIB: ${{ github.action_path }}/../lib.cjs
       with:
-        github-token: ${{ steps.app-token.outputs.token }}
+        github-token: ${{ steps.app-token.outputs.token || inputs.github-token }}
         script: |
           const lib = require(process.env.LIB)
           await lib.run({ github, context, core }, async (ops) => {
@@ -134,7 +141,7 @@ runs:
       env:
         LIB: ${{ github.action_path }}/../lib.cjs
       with:
-        github-token: ${{ steps.app-token.outputs.token }}
+        github-token: ${{ steps.app-token.outputs.token || inputs.github-token }}
         script: |
           const lib = require(process.env.LIB)
           await lib.run({ github, context, core }, async (ops) => {
@@ -158,7 +165,7 @@ runs:
       env:
         LIB: ${{ github.action_path }}/../lib.cjs
       with:
-        github-token: ${{ steps.app-token.outputs.token }}
+        github-token: ${{ steps.app-token.outputs.token || inputs.github-token }}
         script: |
           const lib = require(process.env.LIB)
           await lib.run({ github, context, core }, async (ops) => {
@@ -200,7 +207,7 @@ runs:
       env:
         LIB: ${{ github.action_path }}/../lib.cjs
       with:
-        github-token: ${{ steps.app-token.outputs.token }}
+        github-token: ${{ steps.app-token.outputs.token || inputs.github-token }}
         script: |
           const lib = require(process.env.LIB)
           await lib.run({ github, context, core }, async (ops) => {
@@ -247,7 +254,7 @@ runs:
             for (const reason of reasons) core.info(`ガード条件: ${reason}`)
           })
 
-    # review に渡す値を保存する。completed が無ければ、review は prepare が途中で失敗したとみなして error を反映する
+    # finalize に渡す値を保存する。completed が無ければ、finalize は prepare が途中で失敗したとみなして error を反映する
     - name: Save state
       if: steps.pr.outputs.target == 'true'
       uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
@@ -258,7 +265,6 @@ runs:
         FP: ${{ steps.fingerprint.outputs.fp }}
         PREVIOUS_VERDICT: ${{ steps.previous.outputs.verdict }}
         MODE: ${{ steps.decide.outputs.mode }}
-        GUARD_HIT: ${{ steps.guard.outputs.hit }}
       with:
         script: |
           const lib = require(process.env.LIB)
@@ -268,19 +274,19 @@ runs:
             manualMerge: process.env.MANUAL_MERGE === 'true',
             fp: process.env.FP,
             previousVerdict: process.env.PREVIOUS_VERDICT,
-            mode: process.env.MODE,
-            guardHit: process.env.GUARD_HIT === 'true'
+            mode: process.env.MODE
           })
 
-    # 失敗しても必ず無効にする
-    - name: Revoke GitHub App token
-      if: always() && steps.app-token.outputs.token != ''
-      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-      env:
-        LIB: ${{ github.action_path }}/../lib.cjs
+    # 後続のジョブにデータ（PR の情報・差分・前回の結果・エラー内容など）を渡す
+    # bot.json は渡さない（finalize が自分のトークンから決め直す）
+    - name: Upload prepared data
+      if: always() && steps.pr.outputs.target == 'true'
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
-        github-token: ${{ steps.app-token.outputs.token }}
-        script: |
-          const lib = require(process.env.LIB)
-          await lib.createOps({ github, context, core }).revokeToken()
-          core.info('GitHub App のトークンを無効にしました')
+        name: deps-ai-review-prepare
+        path: |
+          ${{ runner.temp }}/deps-ai-review
+          !${{ runner.temp }}/deps-ai-review/bot.json
+        retention-days: 1
+        if-no-files-found: ignore
+        overwrite: true

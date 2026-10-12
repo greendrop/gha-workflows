@@ -1,7 +1,7 @@
-// deps-ai-review の composite action（prepare/action.yml・review/action.yml）の各ステップから使う共通処理
+// deps-ai-review の composite action（prepare・review・finalize の action.yml）の各ステップから使う共通処理
 //
-// prepare と review は同じジョブで続けて実行する。ステップ間のデータは、短い値はステップの outputs で、
-// 大きい値・prepare から review に渡す値は $RUNNER_TEMP/deps-ai-review/ の JSON ファイルで受け渡す
+// ステップ間のデータは、短い値はステップの outputs で、大きい値は $RUNNER_TEMP/deps-ai-review/ の JSON ファイルで受け渡す
+// （ジョブ間は、そのディレクトリを artifact で受け渡す）
 'use strict'
 
 const { execFileSync } = require('node:child_process')
@@ -30,12 +30,9 @@ const MAX_DIFF_CHARS = 60000
 // enablePullRequestAutoMerge が「すでにマージできる」ために拒否したときのエラー
 // （例: Pull request Pull request is in clean status / is in unstable status）
 const ALREADY_MERGEABLE_RE = /is in (clean|unstable|has_hooks) status/i
-// コメントを書くボット（GitHub App）のログイン（prepare の「Resolve bot login」ステップが bot.json に保存する）
-const botLogin = () => {
-  const login = readJson('bot.json')?.login
-  if (!login) throw new Error('ボットのログインが保存されていません（prepare を先に実行してください）')
-  return login
-}
+// コメントを書くボットのログイン（prepare・finalize の「Resolve bot login」ステップが bot.json に保存する）
+const DEFAULT_BOT_LOGIN = 'github-actions[bot]'
+const botLogin = () => readJson('bot.json')?.login || DEFAULT_BOT_LOGIN
 const MARKER_RE = /<!-- deps-ai-review fp=([0-9a-z]+) verdict=([a-z_]+) -->/
 const DATA_RE = /<!-- deps-ai-review-data ([A-Za-z0-9+/=]+) -->/
 const VERDICT_TEXT = {
@@ -790,11 +787,6 @@ const createOps = ({ github, context, core }) => {
     return autoMergeResult
   }
 
-  // このジョブで作った GitHub App のトークンを無効にする（AI エージェントの実行前に、書き込みのできるトークンを残さない）
-  const revokeToken = async () => {
-    await github.request('DELETE /installation/token')
-  }
-
   // コメントは1件だけにし、更新し続ける
   const upsertComment = async (body) => {
     const previous = findPreviousComment(await listComments())
@@ -813,8 +805,7 @@ const createOps = ({ github, context, core }) => {
     setStateLabel,
     disableAutoMerge,
     applyVerdict,
-    upsertComment,
-    revokeToken
+    upsertComment
   }
 }
 

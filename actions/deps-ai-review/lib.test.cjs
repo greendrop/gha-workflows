@@ -270,12 +270,12 @@ describe('renderComment / findPreviousComment', () => {
     expect(lib.findPreviousComment(comments, 'my-app[bot]')).toBeNull()
   })
 
-  it('ログインを省略すると、prepare が保存したボットのログインを使う', () => {
+  it('ログインを省略すると、保存したボットのログイン（無ければ github-actions[bot]）を使う', () => {
     const saved = process.env.RUNNER_TEMP
     process.env.RUNNER_TEMP = fs.mkdtempSync(path.join(os.tmpdir(), 'deps-ai-review-'))
     try {
       const comments = [{ id: 3, user: { type: 'Bot', login: 'my-app[bot]' }, body }]
-      expect(() => lib.findPreviousComment(comments)).toThrow('ボットのログインが保存されていません')
+      expect(lib.findPreviousComment(comments)).toBeNull()
       lib.writeJson('bot.json', { login: 'my-app[bot]' })
       expect(lib.findPreviousComment(comments)).toMatchObject({ id: 3, fp: 'abcd' })
     } finally {

@@ -1,32 +1,24 @@
 ---
-# Renovate の更新 PR を AI エージェントでレビューする deps-ai-review の後半（composite action）
+# deps-ai-review の review ジョブ（composite action）
 #
-# actions/deps-ai-review/prepare の結果を受けて、必要なら AI エージェント（anthropics/claude-code-action）でレビューし、
-# 判定結果をラベル・auto-merge・PR コメントに反映する。prepare と同じジョブで、prepare の後に実行する。
+# Renovate の更新 PR を AI エージェントでレビューする deps-ai-review の 2 つ目のジョブ。
+# prepare ジョブのデータを受け取り、AI エージェント（anthropics/claude-code-action）でレビューする。
 #
-# - AI エージェントには読み取り権限だけを渡す
-#   - ジョブの GITHUB_TOKEN は読み取りだけにしておく（呼び出し側のジョブの permissions）
-#   - 書き込みのできる GitHub App のトークンは、AI エージェントの実行が終わってから作る
+# - AI エージェントには読み取り権限だけを渡す（プロンプトインジェクションでコメント・コミット・ラベル操作をさせない）
+#   - ジョブの permissions: contents / pull-requests / issues の read
 # - 読み取り系のツール（Read・Grep・Glob）だけを許可し、ファイルの変更・コマンド実行・ネットワークを禁止する
-# - approve のときの自動マージ
-#   - inputs.auto-merge が true でなければ（既定）、レビュー結果だけ示して手動でマージする
-#   - deps-ai-review:manual-merge ラベルが付いた PR は、レビュー結果だけ示して手動でマージする
-#   - 人が deps-ai-review:pass を付けた（手動承認した）ときは、設定やラベルにかかわらず自動マージする
-# - prepare やこのアクションが失敗したときは error として反映し、ジョブを失敗させる
+# - 呼び出し側で事前に用意するもの:
+#   - actions/checkout（persist-credentials: false）
+#   - 依存のインストール（任意。新しいバージョンの CHANGELOG・型定義などを AI エージェントが読めるようにする）
+# - 判定結果は artifact（deps-ai-review-review）で finalize ジョブに渡す
 #
 # 呼び出し例は README を参照
 name: deps-ai-review-review
-description: deps-ai-review の後半。AI エージェントでレビューし、判定結果を PR に反映する
+description: deps-ai-review の review ジョブ。AI エージェントで依存の更新 PR をレビューする
 
 inputs:
   claude-code-oauth-token:
     description: Claude の OAuth トークン（Pro / Max プランで claude setup-token で発行）
-    required: true
-  app-client-id:
-    description: AI レビュー用の GitHub App の Client ID
-    required: true
-  app-private-key:
-    description: AI レビュー用の GitHub App の秘密鍵
     required: true
   dependencies-installed:
     description: PR の依存パッケージをインストールできたか（true のとき、インストール先の CHANGELOG・型定義なども読むよう AI エージェントに伝える）
@@ -40,14 +32,6 @@ inputs:
     description: AI エージェントのモデル（未指定なら Claude Code の既定）
     required: false
     default: ""
-  auto-merge:
-    description: AI が approve した PR を自動マージするか（true のときだけ有効）
-    required: false
-    default: "false"
-  merge-method:
-    description: 自動マージのマージ方法（MERGE / SQUASH / REBASE）
-    required: false
-    default: MERGE
   github-token:
     description: AI エージェントに渡す GitHub のトークン（読み取り権限だけのもの）
     required: false
@@ -56,27 +40,23 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Load state
-      id: state
-      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-      env:
-        LIB: ${{ github.action_path }}/../lib.cjs
+    - name: Check prerequisites
+      shell: bash
+      run: |
+        set -euo pipefail
+        if ! git -C "$GITHUB_WORKSPACE" rev-parse --git-dir > /dev/null 2>&1; then
+          echo "::error::リポジトリが checkout されていません。このアクションの前に actions/checkout を実行してください"
+          exit 1
+        fi
+
+    - name: Download prepared data
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
       with:
-        script: |
-          const lib = require(process.env.LIB)
-          const state = lib.readJson('state.json') || {}
-          core.setOutput('completed', String(state.completed === true))
-          core.setOutput('head-sha', state.headSha || '')
-          core.setOutput('manual-merge', String(state.manualMerge === true))
-          core.setOutput('fp', state.fp || 'unknown')
-          core.setOutput('previous-verdict', state.previousVerdict || '')
-          core.setOutput('mode', state.mode || '')
-          core.setOutput('review', String(state.completed === true && state.mode === 'review' && !state.guardHit))
-          if (state.completed !== true) core.warning('prepare が完了していないため、error として反映します')
+        name: deps-ai-review-prepare
+        path: ${{ runner.temp }}/deps-ai-review
 
     - name: Build review prompt
       id: prompt
-      if: steps.state.outputs.review == 'true'
       uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
       env:
         LIB: ${{ github.action_path }}/../lib.cjs
@@ -110,7 +90,6 @@ runs:
     #   （書き込み権限のあるユーザーは既定で許可される）
     - name: Review with Claude
       id: claude
-      if: steps.state.outputs.review == 'true'
       uses: anthropics/claude-code-action@cab360f6565aa35a51d6ce9e43f1f4287c0a32ea # v1.0.241
       with:
         claude_code_oauth_token: ${{ inputs.claude-code-oauth-token }}
@@ -128,7 +107,6 @@ runs:
 
     # 出力にシークレットの値が含まれていたら伏せてから、判定結果として保存する
     - name: Parse review result
-      if: steps.state.outputs.review == 'true'
       uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
       env:
         LIB: ${{ github.action_path }}/../lib.cjs
@@ -148,120 +126,14 @@ runs:
             core.info(`verdict: ${review.verdict} (confidence: ${review.confidence})`)
           })
 
-    # AI エージェントの実行が終わってから、書き込みのできるトークンを作る（ジョブの終了時に action の後処理で無効になる）
-    # GITHUB_TOKEN で有効にした auto-merge では、マージ後の push で他のワークフローが起動しないため、GitHub App を使う
-    - name: Generate GitHub App token
-      id: app-token
+    - name: Upload review result
       if: always()
-      uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
-        client-id: ${{ inputs.app-client-id }}
-        private-key: ${{ inputs.app-private-key }}
-        permission-contents: write
-        permission-pull-requests: write
-        permission-issues: write
-
-    - name: Apply verdict
-      id: apply
-      if: success() && steps.state.outputs.completed == 'true' && steps.state.outputs.mode != ''
-      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-      env:
-        LIB: ${{ github.action_path }}/../lib.cjs
-        MODE: ${{ steps.state.outputs.mode }}
-        HEAD_SHA: ${{ steps.state.outputs.head-sha }}
-        PREVIOUS_VERDICT: ${{ steps.state.outputs.previous-verdict }}
-        MANUAL_MERGE: ${{ steps.state.outputs.manual-merge }}
-        AUTO_MERGE: ${{ inputs.auto-merge }}
-        MERGE_METHOD: ${{ inputs.merge-method }}
-      with:
-        github-token: ${{ steps.app-token.outputs.token }}
-        script: |
-          const lib = require(process.env.LIB)
-          await lib.run({ github, context, core }, async (ops) => {
-            const previous = lib.readJson('previous.json') || {}
-            let data
-            if (process.env.MODE === 'manual') {
-              // 人の承認として扱い、コメントに承認者と AI の判定を書く
-              const { error, ...rest } = previous
-              data = {
-                ...rest,
-                verdict: 'approve',
-                approved_by: context.payload.sender.login,
-                ai_verdict: previous.ai_verdict || previous.verdict || process.env.PREVIOUS_VERDICT || null
-              }
-            } else if (process.env.MODE === 'reuse') {
-              data = { ...previous, verdict: process.env.PREVIOUS_VERDICT }
-            } else {
-              // ガード条件に当たったときは AI エージェントを呼んでいないので、AI の判定は無し
-              const review = lib.readJson('review.json')
-              data = { ...review, ai_verdict: review.guard ? null : review.verdict }
-            }
-            // manual-merge ラベルが付いた PR は、レビュー結果だけ示して手動でマージする
-            const autoMerge = lib.decideAutoMerge({
-              approvedBy: data.approved_by,
-              autoMergeEnabled: lib.parseAutoMergeEnabled(process.env.AUTO_MERGE),
-              manualMerge: process.env.MANUAL_MERGE === 'true'
-            })
-            const autoMergeResult = await ops.applyVerdict({
-              verdict: data.verdict,
-              headSha: process.env.HEAD_SHA,
-              mergeMethod: (process.env.MERGE_METHOD || 'MERGE').trim().toUpperCase(),
-              autoMerge
-            })
-            lib.writeJson('result.json', { data, autoMergeResult })
-          })
-
-    - name: Update review comment
-      if: success() && steps.apply.outcome == 'success'
-      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-      env:
-        LIB: ${{ github.action_path }}/../lib.cjs
-        FP: ${{ steps.state.outputs.fp }}
-        HEAD_SHA: ${{ steps.state.outputs.head-sha }}
-      with:
-        github-token: ${{ steps.app-token.outputs.token }}
-        script: |
-          const lib = require(process.env.LIB)
-          await lib.run({ github, context, core }, async (ops) => {
-            const { data, autoMergeResult } = lib.readJson('result.json')
-            const body = lib.renderComment({
-              data,
-              fp: process.env.FP,
-              headSha: process.env.HEAD_SHA,
-              autoMergeResult,
-              runUrl: ops.runUrl
-            })
-            await ops.upsertComment(body)
-          })
-
-    # prepare やこのアクションのステップが失敗・キャンセルされたら error として扱う
-    # （error は再利用の対象外なので、次の push で再レビューされる）
-    - name: Report error
-      if: always() && (failure() || cancelled() || steps.state.outputs.completed != 'true')
-      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-      env:
-        LIB: ${{ github.action_path }}/../lib.cjs
-        FP: ${{ steps.state.outputs.fp }}
-        HEAD_SHA: ${{ steps.state.outputs.head-sha }}
-        CLAUDE_OUTCOME: ${{ steps.claude.outcome }}
-      with:
-        github-token: ${{ steps.app-token.outputs.token }}
-        script: |
-          const lib = require(process.env.LIB)
-          const ops = lib.createOps({ github, context, core })
-          // lib.run で記録したエラーが無いときは、AI エージェントのステップ（claude-code-action）の失敗かどうかを見る
-          const error =
-            lib.readJson('error.json')?.message ||
-            (process.env.CLAUDE_OUTCOME === 'failure'
-              ? 'AI エージェントの実行に失敗しました（タイムアウトや利用上限を含む。実行ログを確認してください）'
-              : '不明なエラー（キャンセル・タイムアウトを含む。実行ログを確認してください）')
-          const autoMergeResult = await ops.applyVerdict({ verdict: 'error', headSha: process.env.HEAD_SHA })
-          const body = lib.renderComment({
-            data: { verdict: 'error', error },
-            fp: process.env.FP,
-            headSha: process.env.HEAD_SHA,
-            autoMergeResult,
-            runUrl: ops.runUrl
-          })
-          await ops.upsertComment(body)
-          core.setFailed(`deps-ai-review に失敗しました: ${error}`)
+        name: deps-ai-review-review
+        path: |
+          ${{ runner.temp }}/deps-ai-review/review.json
+          ${{ runner.temp }}/deps-ai-review/error.json
+        retention-days: 1
+        if-no-files-found: ignore
+        overwrite: true
