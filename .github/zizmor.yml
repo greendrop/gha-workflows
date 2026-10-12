@@ -1,0 +1,6 @@
+---
+# zizmor の設定: https://docs.zizmor.sh/configuration/
+rules:
+  # 自リポジトリの参照（./...）を $/... に置き換えるよう指摘されるが、actionlint が $/... に未対応のため無効にする
+  self-repository:
+    disable: true

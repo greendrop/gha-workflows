@@ -1,9 +1,5 @@
 ---
-# actionlint・ghalint・zizmor で GitHub Actions の静的解析をする
-#
-# - actionlint: https://github.com/rhysd/actionlint
-# - ghalint: https://github.com/suzuki-shunsuke/ghalint
-# - zizmor: https://github.com/zizmorcore/zizmor
+# このリポジトリのワークフロー・composite action を静的解析する（actions/github-actions-lint を使う）
 name: repo-github-actions-lint
 
 on:
@@ -11,6 +7,7 @@ on:
     paths:
       - .github/workflows/*.yaml
       - .github/workflows/*.yml
+      - actions/**
       - mise.toml
       - mise.lock
 
@@ -33,13 +30,9 @@ jobs:
       - name: Setup Mise
         uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
 
-      - name: Run actionlint
-        run: actionlint -color
+      - name: Run github-actions-lint
+        uses: ./actions/github-actions-lint
 
-      - name: Run ghalint
-        run: ghalint run
-
-      - name: Run zizmor
-        run: zizmor --gh-token "$GH_TOKEN" .
-        env:
-          GH_TOKEN: ${{ github.token }}
+      # composite action は actions/github-actions-lint の対象外（ghalint run はワークフローだけを見る）なので、ここで lint する
+      - name: Run ghalint for composite actions
+        run: ghalint run-action actions/*/action.yml
