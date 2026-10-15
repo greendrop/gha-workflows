@@ -35,6 +35,8 @@ const DEFAULT_BOT_LOGIN = 'github-actions[bot]'
 const botLogin = () => readJson('bot.json')?.login || DEFAULT_BOT_LOGIN
 const MARKER_RE = /<!-- deps-ai-review fp=([0-9a-z]+) verdict=([a-z_]+) -->/
 const DATA_RE = /<!-- deps-ai-review-data ([A-Za-z0-9+/=]+) -->/
+// このワークフローが Approve したレビューの目印（取り消すときに、他のワークフローや人のレビューと見分けるため）
+const APPROVE_MARKER = '<!-- deps-ai-review-approve -->'
 const VERDICT_TEXT = {
   approve: '✅ approve（マージしてよい）',
   changes_required: '🛠️ changes_required（コード修正が必要）',
@@ -220,11 +222,21 @@ const decideAutoMerge = ({ approvedBy, autoMergeEnabled = false, manualMerge = f
   return { enabled: true }
 }
 
-// inputs.auto-merge の値を解釈する（true のときだけ有効）
+// inputs.auto-merge・inputs.approve の値を解釈する（true のときだけ有効）
 const parseAutoMergeEnabled = (value) =>
   String(value ?? '')
     .trim()
     .toLowerCase() === 'true'
+
+// PR を Approve するか（マージ条件に承認が必要なリポジトリで、自動マージできるようにする）
+// - inputs.approve が true で、AI 自身が approve と判定し、自動マージの対象のときだけ Approve する
+// - 人の手動承認（deps-ai-review:pass）だけでは Approve しない
+//   （ラベルを付けられる Triage 権限の人が、必須の承認をすり抜けられないようにする。人は自分で Approve できる）
+const decideApprove = ({ approveEnabled = false, verdict, aiVerdict, autoMergeEnabled = false, manualMerge = false }) =>
+  approveEnabled &&
+  verdict === 'approve' &&
+  aiVerdict === 'approve' &&
+  decideAutoMerge({ autoMergeEnabled, manualMerge }).enabled
 
 // Renovate が PR 本文に載せる「Release Notes」の見出しがあるか
 const hasReleaseNotes = (body) => /^#{1,4}\s*Release Notes\b/im.test(body || '')
@@ -592,7 +604,7 @@ const buildReviewPrompt = ({
   ].join('\n')
 }
 
-const renderComment = ({ data, fp, headSha, autoMergeResult, runUrl }) => {
+const renderComment = ({ data, fp, headSha, autoMergeResult, approvalResult, runUrl }) => {
   const lines = [`<!-- deps-ai-review fp=${fp} verdict=${data.verdict} -->`, '## 🤖 依存関係更新の AI レビュー', '']
   lines.push(`- **判定**: ${VERDICT_TEXT[data.verdict] || data.verdict}`)
   if (data.confidence) lines.push(`- **AI の確信度**: ${sanitize(data.confidence)}`)
@@ -657,6 +669,7 @@ const renderComment = ({ data, fp, headSha, autoMergeResult, runUrl }) => {
 
   lines.push('### 状態', '')
   lines.push(`- **auto-merge**: ${sanitize(autoMergeResult)}`)
+  if (approvalResult) lines.push(`- **Approve**: ${sanitize(approvalResult)}`)
   lines.push(`- **fp**: \`${fp}\``)
   lines.push(`- **head SHA**: ${headSha}`)
   lines.push('')
@@ -742,6 +755,56 @@ const createOps = ({ github, context, core }) => {
     return `マージ済み（${mergeMethod}。すでにマージできる状態だったため、直接マージしました）`
   }
 
+  // このワークフローが Approve したレビュー（他のワークフローや人のレビューは対象にしない）
+  const listOwnApprovals = async () => {
+    const reviews = await github.paginate(github.rest.pulls.listReviews, {
+      owner,
+      repo,
+      pull_number: prNumber,
+      per_page: 100
+    })
+    const login = botLogin()
+    return reviews.filter(
+      (r) => r.state === 'APPROVED' && r.user?.login === login && (r.body || '').includes(APPROVE_MARKER)
+    )
+  }
+
+  // Approve するか、以前の Approve を取り消し、その結果を返す（コメントに書かないときは null）
+  // - approve: レビューしたコミットを指定して Approve する（head が変わっていたら古いコミットへの承認になる）
+  // - それ以外: 判定が変わった・エラーになったときに、以前の Approve で手動マージできる状態が残らないようにする
+  // 失敗してもラベル・auto-merge の反映は続ける
+  const applyApproval = async ({ approve, headSha }) => {
+    try {
+      const approvals = await listOwnApprovals()
+      if (approve) {
+        if (approvals.some((r) => r.commit_id === headSha)) return 'Approve 済み（設定済み）'
+        await github.rest.pulls.createReview({
+          owner,
+          repo,
+          pull_number: prNumber,
+          commit_id: headSha,
+          event: 'APPROVE',
+          body: `${APPROVE_MARKER}\ndeps-ai-review: AI のレビューで approve と判定しました`
+        })
+        return 'Approve 済み'
+      }
+      for (const r of approvals) {
+        await github.rest.pulls.dismissReview({
+          owner,
+          repo,
+          pull_number: prNumber,
+          review_id: r.id,
+          message: 'deps-ai-review: 判定が approve でなくなった（または自動マージの対象外になった）ため取り消しました'
+        })
+      }
+      return approvals.length > 0 ? '取り消し済み' : null
+    } catch (e) {
+      const action = approve ? 'Approve' : 'Approve の取り消し'
+      core.warning(`${action}に失敗しました: ${e.message}`)
+      return `${action}に失敗: ${e.message}`
+    }
+  }
+
   // 判定結果をラベル・auto-merge に反映し、auto-merge の状態を返す
   // - 判定内容そのものはコミットステータスでは示さず、PR コメントとラベルだけで示す
   //   （changes_required などを failure にすると CI の失敗と見分けづらいため）
@@ -804,6 +867,7 @@ const createOps = ({ github, context, core }) => {
     listComments,
     setStateLabel,
     disableAutoMerge,
+    applyApproval,
     applyVerdict,
     upsertComment
   }
@@ -826,6 +890,7 @@ module.exports = {
   isMajorBump,
   decideAutoMerge,
   parseAutoMergeEnabled,
+  decideApprove,
   hasReleaseNotes,
   findPatchedDependencies,
   collectUsage,

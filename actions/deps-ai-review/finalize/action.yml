@@ -10,6 +10,8 @@
 #   - inputs.auto-merge が true でなければ（既定）、レビュー結果だけ示して手動でマージする
 #   - deps-ai-review:manual-merge ラベルが付いた PR は、レビュー結果だけ示して手動でマージする
 #   - 人が deps-ai-review:pass を付けた（手動承認した）ときは、設定やラベルにかかわらず自動マージする
+# - inputs.approve が true なら、AI が approve と判定して自動マージする PR を Approve する（マージ条件に承認が必要なリポジトリ向け）
+#   - 人の手動承認だけでは Approve しない。判定が approve でなくなったら、以前の Approve を取り消す
 # - 呼び出し側で事前に用意するもの:
 #   - ジョブの permissions: contents / pull-requests / issues の write
 #   - checkout は不要
@@ -42,6 +44,10 @@ inputs:
     description: 自動マージのマージ方法（MERGE / SQUASH / REBASE）
     required: false
     default: MERGE
+  approve:
+    description: AI が approve と判定して自動マージする PR を Approve するか（true のときだけ有効）
+    required: false
+    default: "false"
 
 runs:
   using: composite
@@ -119,6 +125,7 @@ runs:
         MANUAL_MERGE: ${{ steps.state.outputs.manual-merge }}
         AUTO_MERGE: ${{ inputs.auto-merge }}
         MERGE_METHOD: ${{ inputs.merge-method }}
+        APPROVE: ${{ inputs.approve }}
       with:
         github-token: ${{ steps.app-token.outputs.token || inputs.github-token }}
         script: |
@@ -142,11 +149,20 @@ runs:
               const review = lib.readJson('review.json')
               data = { ...review, ai_verdict: review.guard ? null : review.verdict }
             }
+            const autoMergeEnabled = lib.parseAutoMergeEnabled(process.env.AUTO_MERGE)
+            const manualMerge = process.env.MANUAL_MERGE === 'true'
             // manual-merge ラベルが付いた PR は、レビュー結果だけ示して手動でマージする
-            const autoMerge = lib.decideAutoMerge({
-              approvedBy: data.approved_by,
-              autoMergeEnabled: lib.parseAutoMergeEnabled(process.env.AUTO_MERGE),
-              manualMerge: process.env.MANUAL_MERGE === 'true'
+            const autoMerge = lib.decideAutoMerge({ approvedBy: data.approved_by, autoMergeEnabled, manualMerge })
+            // マージ条件に承認が必要なリポジトリでも自動マージできるように、auto-merge を有効にする前に Approve する
+            const approvalResult = await ops.applyApproval({
+              approve: lib.decideApprove({
+                approveEnabled: lib.parseAutoMergeEnabled(process.env.APPROVE),
+                verdict: data.verdict,
+                aiVerdict: data.ai_verdict,
+                autoMergeEnabled,
+                manualMerge
+              }),
+              headSha: process.env.HEAD_SHA
             })
             const autoMergeResult = await ops.applyVerdict({
               verdict: data.verdict,
@@ -154,7 +170,7 @@ runs:
               mergeMethod: (process.env.MERGE_METHOD || 'MERGE').trim().toUpperCase(),
               autoMerge
             })
-            lib.writeJson('result.json', { data, autoMergeResult })
+            lib.writeJson('result.json', { data, autoMergeResult, approvalResult })
           })
 
     - name: Update review comment
@@ -169,12 +185,13 @@ runs:
         script: |
           const lib = require(process.env.LIB)
           await lib.run({ github, context, core }, async (ops) => {
-            const { data, autoMergeResult } = lib.readJson('result.json')
+            const { data, autoMergeResult, approvalResult } = lib.readJson('result.json')
             const body = lib.renderComment({
               data,
               fp: process.env.FP,
               headSha: process.env.HEAD_SHA,
               autoMergeResult,
+              approvalResult,
               runUrl: ops.runUrl
             })
             await ops.upsertComment(body)
@@ -200,12 +217,15 @@ runs:
             (process.env.REVIEW_RESULT === 'failure'
               ? 'AI エージェントの実行に失敗しました（タイムアウトや利用上限を含む。実行ログを確認してください）'
               : '不明なエラー（キャンセル・タイムアウトを含む。実行ログを確認してください）')
+          // 以前の Approve で手動マージできる状態が残らないように取り消す
+          const approvalResult = await ops.applyApproval({ approve: false, headSha: process.env.HEAD_SHA })
           const autoMergeResult = await ops.applyVerdict({ verdict: 'error', headSha: process.env.HEAD_SHA })
           const body = lib.renderComment({
             data: { verdict: 'error', error },
             fp: process.env.FP,
             headSha: process.env.HEAD_SHA,
             autoMergeResult,
+            approvalResult,
             runUrl: ops.runUrl
           })
           await ops.upsertComment(body)

@@ -158,6 +158,7 @@ jobs:
           app-private-key: ${{ secrets.GH_APPS_AI_REVIEW_PRIVATE_KEY }}
           auto-merge: ${{ vars.DEPS_AI_REVIEW_AUTO_MERGE }}
           merge-method: ${{ vars.DEPS_AI_REVIEW_MERGE_METHOD || 'MERGE' }}
+          approve: ${{ vars.DEPS_AI_REVIEW_APPROVE }}
 ```
 
 | action | 設定 | 内容 |
@@ -170,6 +171,7 @@ jobs:
 | finalize | `review-result` | review ジョブの結果（`needs.review.result`）。必須 |
 | finalize | `auto-merge` | `true` で AI が approve した PR を自動マージする（既定値: 無効。導入初期はレビューだけさせて判断を確認する） |
 | finalize | `merge-method` | 自動マージのマージ方法（MERGE / SQUASH / REBASE。既定値: MERGE） |
+| finalize | `approve` | `true` で、AI が approve と判定して自動マージする PR を Approve する（既定値: 無効。[マージ条件に承認が必要なとき](#マージ条件に承認が必要なとき)） |
 
 Renovate の設定で、レビュー対象の PR に `deps-ai-review:pending` を付ける。自動マージしない PR には `deps-ai-review:manual-merge` も付ける。
 
@@ -185,6 +187,19 @@ Renovate の設定で、レビュー対象の PR に `deps-ai-review:pending` �
 - 再レビュー: `deps-ai-review:retry` ラベルを付ける
 - 手動承認: `deps-ai-review:pass` ラベルを付ける（自動マージの設定や `deps-ai-review:manual-merge` にかかわらず auto-merge を有効にする）
 - スクリプトは [`actions/deps-ai-review/lib.cjs`](actions/deps-ai-review/lib.cjs)。テストは `node --test 'actions/**/*.test.cjs'`
+
+### マージ条件に承認が必要なとき
+
+ブランチ保護・ルールセットで承認（Required approvals）が必要なリポジトリでは、`approve: true` にすると、auto-merge を有効にする前に PR を Approve する。
+
+- Approve するのは、AI 自身が approve と判定し、自動マージの対象（`auto-merge` が `true` で、`deps-ai-review:manual-merge` が付いていない）のときだけ
+  - 人の手動承認（`deps-ai-review:pass`）だけでは Approve しない（ラベルを付けられる Triage 権限の人が、必須の承認をすり抜けられないようにするため。人は自分で Approve する）
+- レビューしたコミット（head SHA）を指定して Approve する。新しい push で承認が取り消される設定（Dismiss stale approvals）でも、push で再レビュー（差分が同じなら前回の判定の再利用）されたときに Approve し直す
+- 判定が approve でなくなった・エラーになった・自動マージの対象外になったときは、このワークフローの Approve を取り消す（他のワークフローや人のレビューは取り消さない）
+- Approve するアカウント:
+  - GitHub App（推奨）: Pull requests の Read and write で Approve できる。承認として数えられるよう、App がリポジトリに書き込みできる必要がある
+  - GITHUB_TOKEN: リポジトリ（または Organization）の設定で「Allow GitHub Actions to create and approve pull requests」を有効にする
+- Code Owners のレビューが必要（Require review from Code Owners）なときは、App・Bot は Code Owner になれないため、この Approve だけではマージできない
 
 ## バージョン管理
 

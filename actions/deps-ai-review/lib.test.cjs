@@ -6,7 +6,7 @@ const { execFileSync } = require('node:child_process')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { describe, it } = require('node:test')
+const { after, before, describe, it } = require('node:test')
 
 const lib = require('./lib.cjs')
 
@@ -247,6 +247,19 @@ describe('renderComment / findPreviousComment', () => {
     runUrl: 'https://example.com'
   })
 
+  it('Approve の状態は、結果があるときだけ書く', () => {
+    expect(body).not.toContain('**Approve**')
+    const approved = lib.renderComment({
+      data,
+      fp: 'abcd',
+      headSha: 'sha1',
+      autoMergeResult: '有効',
+      approvalResult: 'Approve 済み',
+      runUrl: ''
+    })
+    expect(approved).toContain('- **Approve**: Approve 済み')
+  })
+
   it('目印の偽装とメンションを無害化する', () => {
     expect(body.match(/<!-- deps-ai-review fp=/g)).toHaveLength(1)
     expect(body).not.toContain('@someone')
@@ -363,6 +376,88 @@ describe('createOps.applyVerdict', () => {
     const { ops, calls } = setup([], null)
     await ops.applyVerdict({ verdict: 'error', headSha: 'sha' })
     expect(calls).toEqual(['+deps-ai-review:error'])
+  })
+})
+
+describe('createOps.applyApproval', () => {
+  const marker = '<!-- deps-ai-review-approve -->'
+  // ボットのログインは保存したもの（bot.json）を使うので、無い状態（github-actions[bot]）で実行する
+  const saved = process.env.RUNNER_TEMP
+  before(() => {
+    process.env.RUNNER_TEMP = fs.mkdtempSync(path.join(os.tmpdir(), 'deps-ai-review-'))
+  })
+  after(() => {
+    if (saved === undefined) delete process.env.RUNNER_TEMP
+    else process.env.RUNNER_TEMP = saved
+  })
+  const setup = (reviews, { createError } = {}) => {
+    const calls = []
+    const github = {
+      paginate: fn(async () => reviews),
+      rest: {
+        pulls: {
+          listReviews: fn(),
+          createReview: fn(async (p) => {
+            if (createError) throw new Error(createError)
+            calls.push(`approve:${p.commit_id}:${p.event}`)
+            expect(p.body).toContain(marker)
+          }),
+          dismissReview: fn(async (p) => calls.push(`dismiss:${p.review_id}`))
+        }
+      }
+    }
+    const context = {
+      repo: { owner: 'o', repo: 'r' },
+      payload: { pull_request: { number: 1 } },
+      serverUrl: '',
+      runId: 1
+    }
+    const ops = lib.createOps({ github, context, core: { warning: fn() } })
+    return { ops, calls }
+  }
+  const own = (id, commitId, state = 'APPROVED') => ({
+    id,
+    state,
+    commit_id: commitId,
+    user: { login: 'github-actions[bot]' },
+    body: `${marker}\napprove`
+  })
+
+  it('approve ならレビューしたコミットを指定して Approve する', async () => {
+    const { ops, calls } = setup([own(1, 'old', 'DISMISSED')])
+    expect(await ops.applyApproval({ approve: true, headSha: 'sha1' })).toBe('Approve 済み')
+    expect(calls).toEqual(['approve:sha1:APPROVE'])
+  })
+
+  it('同じコミットを Approve 済みなら、もう一度 Approve しない', async () => {
+    const { ops, calls } = setup([own(1, 'sha1')])
+    expect(await ops.applyApproval({ approve: true, headSha: 'sha1' })).toBe('Approve 済み（設定済み）')
+    expect(calls).toEqual([])
+  })
+
+  it('approve でなければ、このワークフローの Approve だけを取り消す', async () => {
+    const reviews = [
+      own(1, 'sha1'),
+      own(2, 'sha0', 'DISMISSED'),
+      { ...own(3, 'sha1'), body: 'LGTM' },
+      { ...own(4, 'sha1'), user: { login: 'someone' } }
+    ]
+    const { ops, calls } = setup(reviews)
+    expect(await ops.applyApproval({ approve: false, headSha: 'sha1' })).toBe('取り消し済み')
+    expect(calls).toEqual(['dismiss:1'])
+  })
+
+  it('取り消す Approve が無ければ何もせず、コメントにも書かない', async () => {
+    const { ops, calls } = setup([])
+    expect(await ops.applyApproval({ approve: false, headSha: 'sha1' })).toBeNull()
+    expect(calls).toEqual([])
+  })
+
+  it('Approve に失敗しても例外を投げずに失敗を返す', async () => {
+    const { ops } = setup([], { createError: 'GitHub Actions is not permitted to approve pull requests.' })
+    expect(await ops.applyApproval({ approve: true, headSha: 'sha1' })).toBe(
+      'Approveに失敗: GitHub Actions is not permitted to approve pull requests.'
+    )
   })
 })
 
@@ -489,6 +584,32 @@ describe('decideAutoMerge', () => {
     expect(lib.decideAutoMerge({ approvedBy: 'someone', autoMergeEnabled: false, manualMerge: true })).toEqual({
       enabled: true
     })
+  })
+})
+
+describe('decideApprove', () => {
+  const base = { approveEnabled: true, verdict: 'approve', aiVerdict: 'approve', autoMergeEnabled: true }
+
+  it('有効で、AI が approve と判定し、自動マージの対象なら Approve する', () => {
+    expect(lib.decideApprove(base)).toBe(true)
+  })
+
+  it('approve が有効になっていなければ（既定）Approve しない', () => {
+    expect(lib.decideApprove({ ...base, approveEnabled: undefined })).toBe(false)
+  })
+
+  it('自動マージの対象外（自動マージが無効・manual-merge ラベル）なら Approve しない', () => {
+    expect(lib.decideApprove({ ...base, autoMergeEnabled: false })).toBe(false)
+    expect(lib.decideApprove({ ...base, manualMerge: true })).toBe(false)
+  })
+
+  it('人の手動承認だけ（AI の判定が approve でない）なら Approve しない', () => {
+    expect(lib.decideApprove({ ...base, aiVerdict: 'human_review' })).toBe(false)
+    expect(lib.decideApprove({ ...base, aiVerdict: null })).toBe(false)
+  })
+
+  it('判定が approve でなければ Approve しない', () => {
+    expect(lib.decideApprove({ ...base, verdict: 'changes_required', aiVerdict: 'changes_required' })).toBe(false)
   })
 })
 
