@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/greendrop/gha-workflows/compare/v0.3.0...v0.4.0) (2026-10-15)
+
+
+### Features
+
+* **deps-ai-review:** 自動マージする PR を Approve できるようにする ([#11](https://github.com/greendrop/gha-workflows/issues/11)) ([3e450e6](https://github.com/greendrop/gha-workflows/commit/3e450e6639e5cd5b63d6b5b7ee6f3497ae8f2669))
+
 ## [0.3.0](https://github.com/greendrop/gha-workflows/compare/v0.2.0...v0.3.0) (2026-10-12)
 
 
