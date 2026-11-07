@@ -80,6 +80,7 @@ const run = async ({ github, context, core }, fn) => {
 // - deps-ai-review:pending は Renovate が付けたときだけ（このワークフローが付けたときにも処理すると、エラーが続いたときに実行が繰り返されるため）
 // - retry / pass / manual-merge の付与と、manual-merge の削除（auto-merge の状態を合わせ直す）
 // - ラベル以外のイベント（opened・reopened・synchronize など）はすべて対象
+// 呼び出し側の prepare ジョブの if にも同じ条件を書いている（README の呼び出し例）。条件を変えたら README も合わせる
 const isRelevantEvent = ({ payload, repository }) => {
   if (payload.pull_request?.head?.repo?.full_name !== repository) return false
   const label = payload.label?.name
