@@ -69,6 +69,7 @@ Renovate の更新 PR を AI エージェント（[anthropics/claude-code-action
 - それぞれのジョブの処理を composite action（`actions/deps-ai-review/prepare`・`review`・`finalize`）にしている。ジョブの構成・permissions・checkout・依存のインストールは呼び出し側に書く（パッケージマネージャー・ツールの準備はリポジトリごとに違うため）
 - ジョブ間のデータは artifact（`deps-ai-review-prepare`・`deps-ai-review-review`）で受け渡す
 - 判定結果はラベル（`deps-ai-review:*`）と PR コメントで表す（コミットステータスは付けない。CI のチェックと並ぶと失敗したように見えて紛らわしいため）
+- prepare ジョブの `if` で、処理しないイベント（無関係なラベルの付け外し・Renovate 以外の PR など）ではジョブ自体を起動しないようにする。prepare アクション内でも同じ判定（`lib.cjs` の `isRelevantEvent`・`isTarget`）をするが、ジョブが起動すると数秒で終わっても課金されるため、ジョブの `if` で先に絞る
 - AI レビュー用の GitHub App を指定すると、そのトークンでラベル・コメント・auto-merge を操作する（GITHUB_TOKEN で有効にした auto-merge では、マージ後の push で他のワークフローが起動しないため）。指定しなければ GITHUB_TOKEN を使う
 
 ```yaml
@@ -90,6 +91,23 @@ concurrency:
 
 jobs:
   prepare:
+    # 処理しないイベントではジョブを起動しない（review・finalize も連動してスキップされ、課金されない）
+    # prepare アクション内の判定（lib.cjs の isRelevantEvent・isTarget）と同じ条件をジョブの if で先に絞る
+    # - Renovate が作った、同じリポジトリのブランチからの PR だけ
+    # - labeled: Renovate が付けた pending、または retry / pass / manual-merge の付与だけ
+    # - unlabeled: manual-merge の削除だけ
+    # - それ以外（opened・reopened・synchronize）はすべて対象
+    if: |-
+      github.event.pull_request.user.login == 'renovate[bot]' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      (
+        (github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
+        (github.event.action == 'labeled' && (
+          (github.event.label.name == 'deps-ai-review:pending' && github.event.sender.login == 'renovate[bot]') ||
+          contains(fromJSON('["deps-ai-review:retry", "deps-ai-review:pass", "deps-ai-review:manual-merge"]'), github.event.label.name)
+        )) ||
+        (github.event.action == 'unlabeled' && github.event.label.name == 'deps-ai-review:manual-merge')
+      )
     runs-on: ubuntu-slim
     timeout-minutes: 10
     permissions:
